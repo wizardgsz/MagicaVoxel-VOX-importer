@@ -105,12 +105,14 @@ class ImportVOX(bpy.types.Operator, ImportHelper):
     start_voxel: IntProperty(name="Start Voxel", default=1, min=1)
     end_voxel: IntProperty(name="End Voxel", default=20, min=2)
 
-    use_palette: BoolProperty(name="Use Palette Colors", default=True)
+    use_palette: BoolProperty(name="Use Palette Colors", description="Set voxels palette", default=True)
 
-    gamma_correct: BoolProperty(name="Gamma Correct Colors", default=True)
-    gamma_value: FloatProperty(name="Gamma Correction Value", default=2.2, min=0)
+    gamma_correct: BoolProperty(name="Gamma Correct Colors", description="Apply gamma correction", default=True)
+    gamma_value: FloatProperty(name="Gamma Correction Value", default=2.2, min=1, max=5)
 
     use_shadeless: BoolProperty(name="Use Shadeless Materials", default=False)
+
+    use_materials: BoolProperty(name="Use MATT and MATL", description="Read and apply Matter properties to Materials", default=True)
 
     def execute(self, context):
         paths = [os.path.join(self.directory, name.name)
@@ -138,11 +140,183 @@ class ImportVOX(bpy.types.Operator, ImportHelper):
         if self.gamma_correct:
             layout.prop(self, "gamma_value")
         layout.prop(self, "use_shadeless")
+        layout.prop(self, "use_materials")
+
+
+# Defines material properties aka "Matter" in MagicaVoxel
+from collections import namedtuple
+#from recordtype import recordtype
+material_spec = namedtuple('material_spec', [       # Material chunks, both MATT and MATL
+                                'type_',            # Matter type: _diffuse, _metal, _glass, _emit (_plastic, _media for MATL)
+                                'weight',           # 
+                                'Plastic',          # Plastic for MATT only: MATT uses it as flag in _metal materials
+                                'Roughness',        # Surface roughness
+                                'Specular',         # Specular reflectivity
+                                'IOR',              # Refractive index (glass specific)
+                                'Attenuation',      # Attenuation (glass specific)
+                                'Power',            # Power (emissive specific)
+                                'Glow',             # Light glow (emissive specific)
+                                'isTotalPower'      # True/False (emissive specific)
+                                ], 
+                                defaults = [        # TODO: Default values?
+                                "_diffuse",         # type_
+                                1.0,                # weight
+                                0.0,                # Plastic
+                                0.1,                # Roughness
+                                0.5,                # Specular
+                                1.30,               # IOR
+                                0.0,                # Attenuation
+                                0.0,                # Power
+                                0.0,                # Glow
+                                False               # isTotalPower
+                                ])
+
+
+def read_STRING(vox):
+    size, = struct.unpack('<i', vox.read(4))
+    str = vox.read(size)
+    str = str.decode('utf-8')
+
+    return str
+
+
+def read_DICT(vox):
+    num_of_key_value_pairs, = struct.unpack('<i', vox.read(4))
+
+    dict = {}
+
+    if num_of_key_value_pairs > 0:
+        #print("\tkeys:", num_of_key_value_pairs)
+        for i in range(num_of_key_value_pairs):
+            str1 = read_STRING(vox)
+            str2 = read_STRING(vox)
+            dict[str1] = str2
+
+            print("\t{}: {}".format(str1, str2))
+            #print("\tkey-value: ('{}', '{}')".format(str1, str2))
+
+    return dict
+
+
+def read_MATT(vox, material_specs):
+    matt_id, matt_type, weight = struct.unpack('<iif', vox.read(12))
+    print("MATT({}):".format(matt_id))
+
+    material_types = ["_diffuse", "_metal", "_glass", "_emit"]
+    '''
+    byte_value, = struct.unpack('<i', vox.read(4))
+    reversed_bitstring = '{:032b}'.format(byte_value)[::-1]
+    properties = ['Plastic', 'Roughness', 'Specular', 'IOR', 'Attenuation', 'Power', 'Glow', 'isTotalPower']
+    property_bits = {}
+    property_values = {}
+    for pos, property_ in enumerate(properties):
+        bit_value = reversed_bitstring[pos]
+        property_bits.update({property_: bit_value})
+        if bit_value == '1' and property_ != 'isTotalPower':  # isTotalPower doesn't get a value
+            value,  = struct.unpack('<f', vox.read(4))
+            property_values.update({property_: value})
+        elif bit_value == '1' and property_ == 'isTotalPower':
+            value,  = struct.unpack('<f', vox.read(4))
+        #else:
+        #    property_values.update({property_: '0'})
+    #print("bits:", property_bits)
+    #print("values:", property_values)
+    # isTotalPower is never supplied by this
+    material_specs.update({matt_id: material_spec(type_=material_types[matt_type], weight=weight, **property_values)})
+    '''
+    prop_bits, = struct.unpack('<i', vox.read(4))
+    binary = bin(prop_bits)
+
+    spec = material_spec(type_=material_types[matt_type], weight=weight)
+
+    print("\t_type:", spec.type_)
+    print("\t_weight:", spec.weight)
+
+    if prop_bits & 1:
+        value, = struct.unpack('<f', vox.read(4))
+        spec = spec._replace(Plastic = value)
+        if value > 0:                               # Transform to _plastic material (new in MATL, but not in MATT)
+            spec = spec._replace(type_= '_plastic')
+        print("\t_plastic: %f" % value)
+    if prop_bits & 2:
+        value, = struct.unpack('<f', vox.read(4))
+        spec = spec._replace(Roughness = value)
+        print("\t_rough: %f" % value)
+    if prop_bits & 4:
+        value, = struct.unpack('<f', vox.read(4))
+        spec = spec._replace(Specular = value)
+        print("\t_spec: %f" % value)
+    if prop_bits & 8:
+        value, = struct.unpack('<f', vox.read(4))   # _glass materials: [0.0, 2,0] range
+        value = (value * 3.75) + 0.25               # Map to 0.25 -> 4 range
+        spec = spec._replace(IOR = value)
+        print("\t_ior: %f" % value)
+    if prop_bits & 16:
+        value, = struct.unpack('<f', vox.read(4))   # _glass materials
+        spec = spec._replace(Attenuation = value)
+        print("\t_att: %f" % value)
+    if prop_bits & 32:
+        value, = struct.unpack('<f', vox.read(4))   # _emit materials only: [0, 4] range
+        spec = spec._replace(Power = value)
+        print("\tPower: %f" % value)
+    if prop_bits & 64:
+        value, = struct.unpack('<f', vox.read(4))
+        spec = spec._replace(Glow = value)
+        print("\tGlow: %f" % value)
+    if prop_bits & 128:
+        spec = spec._replace(isTotalPower = True)
+        print("\tisTotalPower: True")
+
+    # isTotalPower is never supplied by this
+    material_specs.update({matt_id: spec})
+
+    return spec
+
+
+def read_MATL(vox, material_specs):
+    matl_id, = struct.unpack('<i', vox.read(4))
+    print("MATL({}):".format(matl_id))
+
+    properties = read_DICT(vox)
+
+    matl_type = properties['_type']
+    weight = float(properties['_weight'])
+
+    spec = material_spec(type_=matl_type, weight=weight)
+
+    #if '_plastic' in properties:
+    #    value = float(properties['_plastic'])      # Plastic is _weight in MATL
+    #    spec = spec._replace(Plastic = value)
+    if '_rough' in properties:
+        value = float(properties['_rough'])
+        spec = spec._replace(Roughness = value)
+    if '_spec' in properties:
+        value = float(properties['_spec'])
+        spec = spec._replace(Specular = value)
+    if '_ior' in properties:
+        value = float(properties['_ior'])           # _glass materials: [0.0, 2,0] range
+        value = (value * 3.75) + 0.25               # Map to 0.25 -> 4 range
+        spec = spec._replace(IOR = value)
+    if '_att' in properties:
+        value = float(properties['_att'])           # _glass materials
+        spec = spec._replace(Attenuation = value)
+    if '_glow' in properties:
+        value = float(properties['_glow'])
+        spec = spec._replace(Glow = value)
+    if '_flux' in properties:
+        value = float(properties['_flux'])          # _emit materials only: [0, 4] range
+        spec = spec._replace(Power = value)
+
+    # isTotalPower is never supplied by this
+    material_specs.update({matl_id: spec})
+
+    return spec
 
 
 def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
                use_bounds=False, start_voxel=None, end_voxel=None,
-               use_palette=True, gamma_correct=True, gamma_value=2.2, use_shadeless=False):
+               use_palette=True, gamma_correct=True, gamma_value=2.2,
+               use_shadeless=False, use_materials=True):
     os.system("cls")
 
     print("\nImporting voxel file {}\n".format(path))
@@ -155,6 +329,7 @@ def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
         voxels = []
         palette = {}
         current_frame = 0
+        material_specs = {}
 
         # assert is VOX 150 file
         assert (struct.unpack('<4ci', vox.read(8)) == (b'V', b'O', b'X', b' ', 150))
@@ -199,19 +374,38 @@ def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
                 for col in range(256):
                     palette.update({col + 1: struct.unpack('<4B', vox.read(4))})
             elif name == 'MATT':
-                # material
-                matt_id, mat_type, weight = struct.unpack('<iif', vox.read(12))
-
-                prop_bits, = struct.unpack('<i', vox.read(4))
-                binary = bin(prop_bits)
-                # Need to read property values, but this gets fiddly
-                # TODO: finish implementation
-                # We have read 16 bytes of this chunk so far, ignoring remainder
-                vox.read(s_self - 16)
+                # material for old file format
+                if use_materials:
+                    material_spec = read_MATT(vox, material_specs)
+                    print(material_spec)
+                else:
+                    vox.read(s_self)
+            elif name == 'MATL':
+                # material for new file format
+                if use_materials:
+                    material_spec = read_MATL(vox, material_specs)
+                    print(material_spec)
+                else:
+                    vox.read(s_self)
+            elif name == 'LAYR':
+                # layer
+                vox.read(s_self)
+            elif name == 'nTRN':
+                # trasform node
+                vox.read(s_self)
+            elif name == 'nGRP':
+                # group node
+                vox.read(s_self)
+            elif name == 'nSHP':
+                # shape node
+                vox.read(s_self)
+            elif name == 'rOBJ':
+                # global settings
+                vox.read(s_self)
             else:
                 # Any other chunk, we don't know how to handle
                 # This puts us out-of-step
-                print("Unknown Chunk id {}".format(name))
+                print('Unknown Chunk id {}'.format(name))
                 return {'CANCELLED'}
 
     if use_bounds:
@@ -233,15 +427,84 @@ def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
             gamma_value = 1
         mat_palette = {}
 
+        print("len(material_specs):", len(material_specs))
+        print("len(used_palette_indices):", len(used_palette_indices))
+
         for index in used_palette_indices:
             palette_entry = palette[index]
             gamma_corrected = [pow(col / 255, gamma_value) for col in palette_entry[:3]]
             gamma_corrected.append(palette_entry[3])
             material = bpy.data.materials.new("Voxel_mat{}".format(index))
             material.diffuse_color = gamma_corrected
+
+            # TODO: add specular, if materials being used
+            # TODO: refactor so that we work on assumption of diffuse, but stay DRY
+            if use_materials and index in material_specs:
+                spec = material_specs[index]
+                mat_type = spec.type_
+                material.use_nodes = True
+                nodes = material.node_tree.nodes
+
+                # https://docs.blender.org/manual/en/latest/render/shader_nodes/shader/principled.html
+                # https://docs.blender.org/manual/en/latest/render/shader_nodes/shader/glass.html
+                # https://docs.blender.org/manual/en/latest/render/shader_nodes/shader/emission.html
+                # https://docs.blender.org/manual/en/latest/render/shader_nodes/shader/glossy.html
+                # https://docs.blender.org/manual/en/latest/render/shader_nodes/shader/volume_absorption.html
+                # https://piziadas.com/it/2014/04/volume-shaders-volume-absorption-blender-cycles.html
+
+                if mat_type == '_diffuse':
+                    # add Principled BSDF settings
+                    node = nodes['Principled BSDF']
+                    node.inputs['Specular'].default_value = spec.Specular
+
+                elif mat_type == '_metal':
+                    # add Principled BSDF settings
+                    node = nodes['Principled BSDF']
+                    node.inputs['Metallic'].default_value = spec.weight
+                    node.inputs['Specular'].default_value = spec.Specular
+                    node.inputs['Roughness'].default_value = spec.Roughness
+
+                elif mat_type == '_glass':
+                    # add Principled BSDF settings
+                    node = nodes['Principled BSDF']
+                    node.inputs['Transmission'].default_value = spec.weight
+                    node.inputs['Specular'].default_value = spec.Specular
+                    node.inputs['Roughness'].default_value = spec.Roughness
+                    node.inputs['IOR'].default_value = spec.IOR
+                    # add Volume Absorption shader to set Attenuation (if > 0.0)
+                    if spec.Attenuation > 0.0:
+                        # get specific node
+                        node_output = nodes.get('Material Output')
+                        # create volume absorption node
+                        node_absorption = nodes.new(type='ShaderNodeVolumeAbsorption')
+                        node_absorption.location = 10,450
+                        node_absorption.inputs['Density'].default_value = spec.Attenuation
+                        # link nodes
+                        links = material.node_tree.links
+                        link = links.new(node_absorption.outputs[0], node_output.inputs['Volume'])
+                    # TODO: enable screen space refraction in material options
+                    # TODO: enable screen space reflections in render options + refraction
+
+                elif mat_type == '_emit':
+                    # emissive
+                    material_to_shader(material, spec)
+                    # TODO: enable BLOOM in render options
+
+                elif mat_type ==  '_plastic':
+                    # glossy plastic
+                    material_to_shader(material, spec)
+
+                # TODO: add '_media' material for MATL (e.g. the cloud matter)
+                #elif mat_type == '_media':
+
+                else:
+                    print("Unknown '{}' material type at index {}".format(mat_type, index))
+            #else:
+            #    material.diffuse_intensity = 1.0
+
             if use_shadeless:
                 material.use_nodes = True
-                material_diffuse_to_emission(material)
+                material_to_shader(material, "_emit")
             mat_palette.update({index: material})
 
     # Using primitive_cube_add once here, to give us a template cube
@@ -282,12 +545,12 @@ def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
 
 #
 # =================================================================================================
-#     Change Diffuse shader to Emission shader without affecting shader color
-#     http://web.purplefrog.com/~thoth/blender/python-cookbook/change-diffuse-to-emission-node.html 
+#     Change "default" shader to Emission shader without affecting its color
+#     http://web.purplefrog.com/~thoth/blender/python-cookbook/change-diffuse-to-emission-node.html
 # =================================================================================================
 #
-def replace_with_emission(node, node_tree):
-    new_node = node_tree.nodes.new('ShaderNodeEmission')
+def replace_with_shader(node, node_tree, shader_type):
+    new_node = node_tree.nodes.new(shader_type)
     connected_sockets_out = []
     sock = node.inputs[0]
     if len(sock.links) > 0:
@@ -298,7 +561,7 @@ def replace_with_emission(node, node_tree):
 
     for sock in node.outputs:
         if len(sock.links) > 0:
-            connected_sockets_out.append(sock.links[0].to_socket)
+            connected_sockets_out.append( sock.links[0].to_socket)
         else:
             connected_sockets_out.append(None)
 
@@ -311,16 +574,45 @@ def replace_with_emission(node, node_tree):
     if connected_sockets_out[0] is not None:
         node_tree.links.new(connected_sockets_out[0], new_node.outputs[0])
 
+    return new_node
 
-def material_diffuse_to_emission(mat):
+
+def material_to_shader(mat, matter):
 
     doomed = []
+
+    # accept both 'material_spec' or 'str' types
+    if isinstance(matter, material_spec):
+        shader_type = matter.type_
+    elif isinstance(matter, str):
+        shader_type = matter
+
     for node in mat.node_tree.nodes:
-        if node.type == 'BSDF_DIFFUSE' or node.type == 'BSDF_PRINCIPLED':
-            replace_with_emission(node, mat.node_tree)
+        if node.type == 'BSDF_PRINCIPLED':
+            if shader_type == '_diffuse':
+                new_node = replace_with_shader(node, mat.node_tree, 'ShaderNodeBsdfDiffuse')
+                if isinstance(matter, material_spec):
+                    new_node.inputs["Roughness"].default_value = matter.Roughness
+            elif shader_type == '_glass':
+                new_node = replace_with_shader(node, mat.node_tree, 'ShaderNodeBsdfGlass')
+                if isinstance(matter, material_spec):
+                    new_node.inputs["Roughness"].default_value = matter.Roughness
+                    new_node.inputs["IOR"].default_value = matter.IOR
+            elif shader_type == '_metal':
+                new_node = replace_with_shader(node, mat.node_tree, 'ShaderNodeBsdfGlossy')
+                if isinstance(matter, material_spec):
+                    new_node.inputs["Roughness"].default_value = matter.Roughness
+            elif shader_type == '_emit':
+                new_node = replace_with_shader(node, mat.node_tree, 'ShaderNodeEmission')
+                if isinstance(matter, material_spec):
+                    new_node.inputs["Strength"].default_value = (matter.Power * 2.0) + 1.0
+            elif shader_type == '_plastic':
+                new_node = replace_with_shader(node, mat.node_tree, 'ShaderNodeBsdfGlossy')
+                if isinstance(matter, material_spec):
+                    new_node.inputs["Roughness"].default_value = matter.Roughness
             doomed.append(node)
-        else:
-            print(node.type)
+        #else:
+        #    print("Skipping node '%s':" % node.name, node.type)
 
     # wait until we are done iterating and adding before we start wrecking things
     for node in doomed:
@@ -355,3 +647,7 @@ def unregister():
 
 if __name__ == "__main__":
     register()
+
+    # Test call
+    bpy.ops.import_scene.vox('INVOKE_DEFAULT')
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
