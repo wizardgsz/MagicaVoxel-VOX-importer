@@ -198,7 +198,10 @@ def read_DICT(vox):
     return dict
 
 
-def read_MATT(vox, material_specs):
+def read_MATT(vox, material_specs, s_self):
+    # Get the current position of the file
+    offset = vox.tell()
+
     matt_id, matt_type, weight = struct.unpack('<iif', vox.read(12))
     print("MATT({}):".format(matt_id))
 
@@ -267,7 +270,13 @@ def read_MATT(vox, material_specs):
         spec = spec._replace(isTotalPower = True)
         print("\tisTotalPower: True")
 
-    # isTotalPower is never supplied by this
+    # TODO: isTotalPower is never supplied by this
+    # Set the pointer to the beginning of the chunk to skip it
+    # emit Total Power ON.vox
+    # MATT deer.vox
+    vox.seek(offset)
+    vox.read(s_self)
+
     material_specs.update({matt_id: spec})
 
     return spec
@@ -376,7 +385,7 @@ def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
             elif name == 'MATT':
                 # material for old file format
                 if use_materials:
-                    material_spec = read_MATT(vox, material_specs)
+                    material_spec = read_MATT(vox, material_specs, s_self)
                     print(material_spec)
                 else:
                     vox.read(s_self)
@@ -405,7 +414,7 @@ def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
             else:
                 # Any other chunk, we don't know how to handle
                 # This puts us out-of-step
-                print('Unknown Chunk id {}'.format(name))
+                print("Unknown Chunk id {}".format(name))
                 return {'CANCELLED'}
 
     if use_bounds:
@@ -427,8 +436,8 @@ def import_vox(path, *, voxel_spacing=1, voxel_size=1, load_frame=0,
             gamma_value = 1
         mat_palette = {}
 
-        print("len(material_specs):", len(material_specs))
-        print("len(used_palette_indices):", len(used_palette_indices))
+        print("Materials loaded, len(material_specs):", len(material_specs))
+        print("Palette entries used, len(used_palette_indices):", len(used_palette_indices))
 
         for index in used_palette_indices:
             palette_entry = palette[index]
@@ -561,7 +570,7 @@ def replace_with_shader(node, node_tree, shader_type):
 
     for sock in node.outputs:
         if len(sock.links) > 0:
-            connected_sockets_out.append( sock.links[0].to_socket)
+            connected_sockets_out.append(sock.links[0].to_socket)
         else:
             connected_sockets_out.append(None)
 
